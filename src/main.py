@@ -3,9 +3,61 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from PIL import Image, ImageTk
 from material_calc import calculate_material_quantity
+import sys
+import os
+import shutil
 
-conn = sqlite3.connect('wallpaper_company.db')
-cursor = conn.cursor()
+def resource_path(relative_path):
+    try:
+        base_path = sys._MEIPASS
+    except AttributeError:
+        base_path = os.path.abspath(".")
+    
+    return os.path.join(base_path, relative_path)
+
+def get_permanent_db_path():
+    if getattr(sys, 'frozen', False):
+        base_path = os.path.dirname(sys.executable)
+    else:
+        base_path = os.path.abspath(".")
+    
+    return os.path.join(base_path, 'wallpaper_company.db')
+
+def initialize_database():
+    permanent_db_path = get_permanent_db_path()
+    if not os.path.exists(permanent_db_path):
+        try:
+            temp_db_path = resource_path('wallpaper_company.db')
+            if os.path.exists(temp_db_path):
+                shutil.copy(temp_db_path, permanent_db_path)
+            else:
+                conn = sqlite3.connect(permanent_db_path)
+                cursor = conn.cursor()
+                with open(resource_path('schema.sql'), 'r') as f:
+                    cursor.executescript(f.read())
+                with open(resource_path('schema2.sql'), 'r') as f:
+                    cursor.executescript(f.read())
+                with open(resource_path('data.sql'), 'r') as f:
+                    cursor.executescript(f.read())
+                with open(resource_path('data_import.sql'), 'r') as f:
+                    cursor.executescript(f.read())
+                conn.commit()
+                conn.close()
+                messagebox.showinfo("Информация", "База данных была создана заново. Пожалуйста, перезапустите приложение.")
+                sys.exit(0)
+        except FileNotFoundError as e:
+            messagebox.showerror("Ошибка", f"Не удалось создать базу данных: {str(e)}. Убедитесь, что файлы schema.sql, schema2.sql, data.sql, data_import.sql доступны.")
+            sys.exit(1)
+
+    return permanent_db_path
+
+try:
+    db_path = initialize_database()
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+except sqlite3.OperationalError as e:
+    messagebox.showerror("Ошибка", f"Не удалось подключиться к базе данных: {str(e)}. Убедитесь, что файл 'wallpaper_company.db' доступен.")
+    sys.exit(1)
 
 def calculate_product_cost(product_id):
     cursor.execute("""
@@ -152,7 +204,7 @@ def open_edit_form(product_id=None):
             messagebox.showerror("Ошибка", f"Произошла ошибка: {str(e)}", parent=edit_window)
 
     tk.Button(edit_window, text="Сохранить", font=("Gabriola", 12), bg="#2D6033", fg="#FFFFFF", command=save_product).pack(pady=10)
-    tk.Button(edit_window, text="Отмена", font=("Gabriola", 12), bg="#FFFFFF", command=edit_window.destroy).pack(pady=5)
+    tk.Button(edit_window, text="Назад", font=("Gabriola", 12), bg="#2D6033", fg="#FFFFFF", command=edit_window.destroy).pack(pady=5)
 
 def show_materials(product_id):
     materials_window = tk.Toplevel(root)
@@ -165,7 +217,7 @@ def show_materials(product_id):
     product_type_id = cursor.fetchone()[0]
 
     cursor.execute("""
-        SELECT m.name, pm.required_quantity, m.material_id
+        SELECT m.material_id, m.name, pm.required_quantity, m.stock_quantity
         FROM product_material pm
         JOIN material m ON pm.material_id = m.material_id
         WHERE pm.product_id = ?
@@ -190,22 +242,19 @@ def show_materials(product_id):
     tree.column("Quantity", width=150)
     tree.pack(pady=10)
 
+    material_mapping = {}
     for material in materials:
-        tree.insert("", "end", values=(material[0], f"{material[1]}"))
+        material_id, name, req_quantity, stock = material
+        row_id = tree.insert("", "end", values=(name, f"{req_quantity}"))
+        material_mapping[row_id] = (material_id, stock)
 
     calc_frame = ttk.Frame(scrollable_frame, style="Custom.TFrame")
     calc_frame.pack(pady=10, padx=10, fill="x")
 
     tk.Label(calc_frame, text="Рассчитать количество материала", font=("Gabriola", 14, "bold"), fg="#2D6033", bg="#FFFFFF").grid(row=0, column=0, columnspan=2, pady=5)
 
-    cursor.execute("SELECT material_type_id, name FROM material_type WHERE material_type_id != 1")
-    material_types = cursor.fetchall()
-    material_type_names = [mt[1] for mt in material_types]
-    material_type_ids = {mt[1]: mt[0] for mt in material_types}
-
-    tk.Label(calc_frame, text="Тип материала:", font=("Gabriola", 12), bg="#FFFFFF").grid(row=1, column=0, pady=5, sticky="e")
-    material_type_var = tk.StringVar(value=material_type_names[0] if material_type_names else "")
-    ttk.Combobox(calc_frame, textvariable=material_type_var, values=material_type_names, font=("Gabriola", 12), state="readonly").grid(row=1, column=1, pady=5)
+    selected_material_label = tk.Label(calc_frame, text="Выберите материал из таблицы выше", font=("Gabriola", 12), fg="#2D6033", bg="#FFFFFF")
+    selected_material_label.grid(row=1, column=0, columnspan=2, pady=5)
 
     tk.Label(calc_frame, text="Количество продукции:", font=("Gabriola", 12), bg="#FFFFFF").grid(row=2, column=0, pady=5, sticky="e")
     product_quantity_var = tk.StringVar()
@@ -221,21 +270,38 @@ def show_materials(product_id):
 
     tk.Label(calc_frame, text="Количество на складе:", font=("Gabriola", 12), bg="#FFFFFF").grid(row=5, column=0, pady=5, sticky="e")
     stock_quantity_var = tk.StringVar()
-    tk.Entry(calc_frame, textvariable=stock_quantity_var, font=("Gabriola", 12)).grid(row=5, column=1, pady=5)
+    stock_entry = tk.Entry(calc_frame, textvariable=stock_quantity_var, font=("Gabriola", 12), state="readonly")
+    stock_entry.grid(row=5, column=1, pady=5)
+
+    def on_material_select(event):
+        selected_item = tree.selection()
+        if selected_item:
+            material_id, stock = material_mapping[selected_item[0]]
+            material_name = tree.item(selected_item[0], "values")[0]
+            selected_material_label.config(text=f"Выбранный материал: {material_name}")
+            stock_quantity_var.set(str(stock))
+
+    tree.bind("<<TreeviewSelect>>", on_material_select)
 
     def calculate_material():
+        selected_item = tree.selection()
+        if not selected_item:
+            messagebox.showerror("Ошибка", "Пожалуйста, выберите материал из таблицы.", parent=materials_window)
+            return
+
+        material_id, stock = material_mapping[selected_item[0]]
         try:
-            material_type_id = material_type_ids[material_type_var.get()]
             product_quantity = int(product_quantity_var.get())
             param1 = float(param1_var.get())
             param2 = float(param2_var.get())
             stock_quantity = float(stock_quantity_var.get())
 
-            result = calculate_material_quantity(cursor, product_type_id, material_type_id, product_quantity, param1, param2, stock_quantity)
+            result = calculate_material_quantity(cursor, product_type_id, material_id, product_quantity, param1, param2, stock_quantity)
             if result == -1:
-                messagebox.showerror("Ошибка", "Неверные параметры: проверьте типы продукции, материала и введенные значения.", parent=materials_window)
+                messagebox.showerror("Ошибка", "Неверные параметры: проверьте введенные значения.", parent=materials_window)
             else:
-                messagebox.showinfo("Результат", f"Необходимое количество материала: {result}", parent=materials_window)
+                material_name = tree.item(selected_item[0], "values")[0]
+                messagebox.showinfo("Результат", f"Необходимое количество материала '{material_name}': {result}", parent=materials_window)
 
         except ValueError as ve:
             messagebox.showerror("Ошибка", "Пожалуйста, введите корректные числовые значения.", parent=materials_window)
@@ -254,12 +320,14 @@ root.geometry('900x900+200+100')
 root.resizable(width=False, height=False)
 
 try:
-    root.iconbitmap("res/icon.ico")
+    icon_path = resource_path("res/icon.ico")
+    root.iconbitmap(icon_path)
 except tk.TclError:
     pass
 
 try:
-    logo_img = Image.open("res/logo.png")
+    logo_path = resource_path("res/logo.png")
+    logo_img = Image.open(logo_path)
     logo_img = logo_img.resize((100, 100), Image.Resampling.LANCZOS)
     logo_photo = ImageTk.PhotoImage(logo_img)
     logo_label = tk.Label(root, image=logo_photo, bg="#FFFFFF")
